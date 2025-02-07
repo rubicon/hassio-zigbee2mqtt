@@ -1,14 +1,17 @@
 ARG BUILD_FROM
-FROM $BUILD_FROM
+FROM $BUILD_FROM as base
 
 ENV LANG C.UTF-8
 ARG BUILD_VERSION
 
-RUN apk add --no-cache --virtual .build-dependencies \
-    make gcc g++ linux-headers udev git python3 && \
-    apk add --no-cache nodejs npm socat
+RUN apk add --no-cache socat tini nodejs eudev
 
-RUN if [ "${BUILD_VERSION}" = "edge" ]; \
+# Dependencies and build
+FROM base as dependencies_and_build
+
+RUN apk add --no-cache --virtual .buildtools npm make gcc g++ linux-headers udev git python3 && \
+    npm install -g pnpm && \
+    if [ "${BUILD_VERSION}" = "edge" ]; \
     then \
         echo "Installing Edge version" && \
         git clone -b dev --single-branch --depth 1 \
@@ -24,18 +27,26 @@ RUN if [ "${BUILD_VERSION}" = "edge" ]; \
         mkdir /app/dist && \
         jq -n --arg commit ${BUILD_VERSION%-*} '$commit' > /app/dist/.hash ; \
     fi; \
-    echo "Installed zigbee2mqtt @ version $(cat /app/dist/.hash)"
-
-RUN cd /app && \
-    npm ci --no-audit --no-optional --no-update-notifier --unsafe-perm && \
-    npm run build && \
+    echo "Installed Zigbee2MQTT @ version $(cat /app/dist/.hash)" && \
+    cd /app && \
+    pnpm install --frozen-lockfile --no-optional --unsafe-perm && \
+    pnpm run build && \
     rm -rf node_modules && \
-    npm ci --no-audit --no-optional --no-update-notifier --only=production --unsafe-perm && \
-    apk del --no-cache --purge .build-dependencies && \
-    rm -rf docs test images data docker LICENSE README.md update.sh lib && \
-    rm -rf npm-shrinkwrap.json \
-          node-modules/zigbee-herdsman/npm-shrinkwrap.json \
-          node-modules/zigbee-herdsman-converters/npm-shrinkwrap.json && \
-    rm -rf /root/.cache /root/.npm
+    pnpm install --frozen-lockfile --no-optional --unsafe-perm --prod && \
+    # serialport has outdated prebuilds that appear to fail on some archs, force build on target platform
+    rm -rf `find ./node_modules/.pnpm/ -wholename "*/@serialport/bindings-cpp/prebuilds" -type d` && \
+    pnpm rebuild @serialport/bindings-cpp
+
+# Release
+FROM base as release
+
+WORKDIR /app
 
 COPY rootfs /
+COPY --from=dependencies_and_build /app/node_modules ./node_modules
+COPY --from=dependencies_and_build /app/dist ./dist
+COPY --from=dependencies_and_build /app/package.json /app/LICENSE /app/index.js ./
+
+ENV NODE_ENV production
+
+ENTRYPOINT [ "/sbin/tini", "--", "/docker-entrypoint.sh"]
